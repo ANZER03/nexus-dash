@@ -1,0 +1,5 @@
+{
+  "name": "E-Commerce Nexus Dashboard",
+  "description": "A high-performance, Grafana-inspired real-time monitoring dashboard for tracking global user activities, sales metrics, and infrastructure health.",
+  "requestFramePermissions": []
+}
