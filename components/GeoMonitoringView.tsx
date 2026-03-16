@@ -1,5 +1,5 @@
 
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { 
   Globe, 
   Crosshair,
@@ -13,12 +13,43 @@ const GeoMonitoringView: React.FC = () => {
   const { regions, activities, geo, flows } = useNexusData();
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRegion, setSelectedRegion] = useState<string | null>(null);
+  const [isDesktop, setIsDesktop] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    return window.matchMedia('(min-width: 1024px)').matches;
+  });
 
   const filteredRegions = useMemo(() => {
     return regions
       .filter(r => r.name.toLowerCase().includes(searchQuery.toLowerCase()))
       .sort((a, b) => b.sales - a.sales);
   }, [regions, searchQuery]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const mediaQuery = window.matchMedia('(min-width: 1024px)');
+    const updateLayout = (event: MediaQueryListEvent | MediaQueryList) => {
+      setIsDesktop(event.matches);
+    };
+
+    updateLayout(mediaQuery);
+    const listener = (event: MediaQueryListEvent) => updateLayout(event);
+    mediaQuery.addEventListener('change', listener);
+
+    return () => mediaQuery.removeEventListener('change', listener);
+  }, []);
+
+  const mapCanvas = (
+    <div className="relative h-full">
+      <WorldMap
+        regions={regions}
+        flows={flows}
+        selectedRegion={selectedRegion}
+        onSelectRegion={setSelectedRegion}
+      />
+      <div className="absolute inset-0 pointer-events-none opacity-[0.03] bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.25)_50%),linear-gradient(90deg,rgba(255,0,0,0.06),rgba(0,255,0,0.02),rgba(0,0,255,0.06))] bg-[length:100%_2px,3px_100%]"></div>
+    </div>
+  );
 
   return (
     <div className="flex flex-col h-full bg-[#0b0c10] overflow-hidden select-none">
@@ -67,7 +98,8 @@ const GeoMonitoringView: React.FC = () => {
       {/* Mobile: scrollable vertical stack. Desktop: side-by-side grid */}
       <div className="flex-1 min-h-0 overflow-hidden">
         {/* Desktop layout */}
-        <div className="hidden lg:grid grid-cols-12 gap-0 h-full relative">
+        {isDesktop ? (
+        <div className="grid grid-cols-12 gap-0 h-full relative">
           {/* Left HUD Panel */}
           <div className="col-span-3 flex flex-col border-r border-[#2c3235] bg-black/20 z-10">
             <div className="p-4 bg-white/5 border-b border-[#2c3235] flex items-center gap-2">
@@ -101,13 +133,7 @@ const GeoMonitoringView: React.FC = () => {
           </div>
 
           {/* Centerpiece 3D Globe */}
-          <div className="col-span-6 flex flex-col relative">
-             <div className="flex-1">
-                <WorldMap regions={regions} flows={flows} />
-             </div>
-             {/* Floating Scanlines Effect */}
-             <div className="absolute inset-0 pointer-events-none opacity-[0.03] bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.25)_50%),linear-gradient(90deg,rgba(255,0,0,0.06),rgba(0,255,0,0.02),rgba(0,0,255,0.06))] bg-[length:100%_2px,3px_100%]"></div>
-          </div>
+           <div className="col-span-6 flex flex-col relative">{mapCanvas}</div>
 
           {/* Right Event Log Panel */}
           <div className="col-span-3 flex flex-col border-l border-[#2c3235] bg-black/20 z-10">
@@ -138,13 +164,11 @@ const GeoMonitoringView: React.FC = () => {
              </div>
           </div>
         </div>
-
-        {/* Mobile layout -- vertical scroll */}
-        <div className="lg:hidden h-full overflow-y-auto">
+        ) : (
+        <div className="h-full overflow-y-auto">
           {/* Globe section */}
           <div className="relative" style={{ height: '50vh', minHeight: '280px', maxHeight: '400px' }}>
-            <WorldMap regions={regions} flows={flows} />
-            <div className="absolute inset-0 pointer-events-none opacity-[0.03] bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.25)_50%),linear-gradient(90deg,rgba(255,0,0,0.06),rgba(0,255,0,0.02),rgba(0,0,255,0.06))] bg-[length:100%_2px,3px_100%]"></div>
+            {mapCanvas}
           </div>
 
           {/* Node Monitoring - horizontal scroll cards on mobile */}
@@ -204,6 +228,7 @@ const GeoMonitoringView: React.FC = () => {
              </div>
           </div>
         </div>
+        )}
       </div>
       
       {/* Custom Global Scrollbar Style */}
