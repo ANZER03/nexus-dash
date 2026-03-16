@@ -1,35 +1,167 @@
-
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
-import { RegionMetric, DataFlow } from '../types';
+import type { DataFlow, RegionMetric } from '../types';
+
+interface WorldFeature {
+  type: string;
+  properties?: {
+    name?: string;
+  };
+  geometry: object;
+}
+
+interface WorldGeoJson {
+  type: string;
+  features: WorldFeature[];
+}
+
+interface CountryAggregate {
+  name: string;
+  sales: number;
+  intensity: number;
+  nodeCount: number;
+}
+
+interface TooltipState {
+  x: number;
+  y: number;
+  content: CountryAggregate | null;
+}
 
 interface WorldMapProps {
   regions: RegionMetric[];
   flows: DataFlow[];
+  selectedRegion?: string | null;
+  onSelectRegion?: (regionName: string | null) => void;
 }
 
-const WorldMap: React.FC<WorldMapProps> = ({ regions, flows }) => {
+const WORLD_GEOJSON_URL = '/world.geojson';
+
+let worldGeoJsonPromise: Promise<WorldGeoJson> | null = null;
+
+const initialRotation: [number, number, number] = [0, -30, 0];
+
+const normalizeName = (value: string) => value.trim().toLowerCase();
+
+const getFeatureName = (feature: WorldFeature) => feature.properties?.name ?? 'Unknown';
+
+function loadWorldGeoJson() {
+  if (!worldGeoJsonPromise) {
+    worldGeoJsonPromise = d3.json<WorldGeoJson>(WORLD_GEOJSON_URL).then((data) => {
+      if (!data) {
+        throw new Error('Unable to load world geometry');
+      }
+
+      return data;
+    });
+  }
+
+  return worldGeoJsonPromise;
+}
+
+const WorldMap: React.FC<WorldMapProps> = ({
+  regions,
+  flows,
+  selectedRegion = null,
+  onSelectRegion,
+}) => {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const geoDataRef = useRef<any>(null);
-  // Keep latest props in refs for D3 imperative rendering (avoids stale closures)
-  const dataRef = useRef<RegionMetric[]>(regions);
-  const flowsRef = useRef<DataFlow[]>(flows);
-  const rotationRef = useRef<[number, number, number]>([0, -30, 0]);
+  const geoDataRef = useRef<WorldGeoJson | null>(null);
+  const countryAggregatesRef = useRef<Map<string, CountryAggregate>>(new Map());
+  const regionCountryCacheRef = useRef<Map<string, string>>(new Map());
+  const rotationRef = useRef<[number, number, number]>(initialRotation);
   const renderScheduledRef = useRef(false);
+  const initializedRef = useRef(false);
 
-  const [tooltip, setTooltip] = useState<{ x: number; y: number; content: RegionMetric | null }>({
-    x: 0,
-    y: 0,
-    content: null,
-  });
-  const [rotationDisplay, setRotationDisplay] = useState<[number, number, number]>([0, -30, 0]);
+  const [tooltip, setTooltip] = useState<TooltipState>({ x: 0, y: 0, content: null });
+  const [rotationDisplay, setRotationDisplay] = useState<[number, number, number]>(initialRotation);
 
-  // Render the globe imperatively using D3 -- no React state in the loop
+  const syncCountryAggregates = useCallback((nextRegions: RegionMetric[]) => {
+    const geoData = geoDataRef.current;
+    if (!geoData) return;
+
+    const nextAggregates = new Map<string, CountryAggregate>();
+    const featureByName = new Map(
+      geoData.features.map((feature) => [normalizeName(getFeatureName(feature)), feature])
+    );
+
+    nextRegions.forEach((region) => {
+      const regionKey = `${normalizeName(region.name)}:${region.coords[0]},${region.coords[1]}`;
+      let countryName = regionCountryCacheRef.current.get(regionKey);
+
+      if (!countryName) {
+        const namedFeature = featureByName.get(normalizeName(region.name));
+        const fallbackFeature =
+          namedFeature ??
+          geoData.features.find((feature) =>
+            d3.geoContains(feature as any, region.coords as [number, number])
+          );
+
+        countryName = fallbackFeature ? getFeatureName(fallbackFeature) : region.name;
+        regionCountryCacheRef.current.set(regionKey, countryName);
+      }
+
+      const aggregate = nextAggregates.get(countryName) ?? {
+        name: countryName,
+        sales: 0,
+        intensity: 0,
+        nodeCount: 0,
+      };
+
+      aggregate.sales += region.sales;
+      aggregate.intensity += region.intensity;
+      aggregate.nodeCount += 1;
+      nextAggregates.set(countryName, aggregate);
+    });
+
+    nextAggregates.forEach((aggregate) => {
+      aggregate.intensity /= aggregate.nodeCount || 1;
+    });
+
+    countryAggregatesRef.current = nextAggregates;
+  }, []);
+
+  const initializeScene = useCallback(() => {
+    if (!svgRef.current || initializedRef.current) return;
+
+    const svg = d3.select(svgRef.current);
+    svg.attr('class', 'w-full h-full cursor-move');
+
+    const defs = svg.append('defs');
+    const filter = defs.append('filter').attr('id', 'glow');
+    filter.append('feGaussianBlur').attr('stdDeviation', '8').attr('result', 'blur');
+    const feMerge = filter.append('feMerge');
+    feMerge.append('feMergeNode').attr('in', 'blur');
+    feMerge.append('feMergeNode').attr('in', 'SourceGraphic');
+
+    svg.append('circle').attr('data-layer', 'atmosphere');
+    svg.append('path').attr('data-layer', 'graticule');
+    svg.append('g').attr('data-layer', 'land');
+    svg.append('g').attr('data-layer', 'flows');
+    svg.append('g').attr('data-layer', 'focus');
+
+    const drag = d3.drag<SVGSVGElement, unknown>().on('drag', (event) => {
+      const sensitivity = 0.25;
+      rotationRef.current = [
+        rotationRef.current[0] + event.dx * sensitivity,
+        Math.max(-90, Math.min(90, rotationRef.current[1] - event.dy * sensitivity)),
+        rotationRef.current[2],
+      ];
+      setRotationDisplay([...rotationRef.current] as [number, number, number]);
+      scheduleRender();
+    });
+
+    svg.call(drag as never);
+    initializedRef.current = true;
+  }, []);
+
   const renderGlobe = useCallback(() => {
     renderScheduledRef.current = false;
 
     if (!svgRef.current || !containerRef.current || !geoDataRef.current) return;
+
+    initializeScene();
 
     const svg = d3.select(svgRef.current);
     const container = containerRef.current;
@@ -40,30 +172,24 @@ const WorldMap: React.FC<WorldMapProps> = ({ regions, flows }) => {
 
     const radius = Math.min(width, height) / 2.2;
     const rotation = rotationRef.current;
-    const data = dataRef.current;
-
-    svg.selectAll('*').remove();
-    svg.attr('width', width).attr('height', height);
-
-    // Glow filter
-    const defs = svg.append('defs');
-    const filter = defs.append('filter').attr('id', 'glow');
-    filter.append('feGaussianBlur').attr('stdDeviation', '8').attr('result', 'blur');
-    const feMerge = filter.append('feMerge');
-    feMerge.append('feMergeNode').attr('in', 'blur');
-    feMerge.append('feMergeNode').attr('in', 'SourceGraphic');
-
     const projection = d3
       .geoOrthographic()
       .scale(radius)
       .translate([width / 2, height / 2])
-      .rotate(rotation);
-
+      .rotate(rotation)
+      .clipAngle(90);
     const path = d3.geoPath().projection(projection);
+    const graticule = d3.geoGraticule();
 
-    // Atmosphere
-    svg
-      .append('circle')
+    const countryAggregates = countryAggregatesRef.current;
+    const intensityScale = d3
+      .scaleLinear<string>()
+      .domain([0, 45, 75, 100])
+      .range(['#111217', '#14313d', '#126177', '#32d74b'])
+      .clamp(true);
+
+    const atmosphere = svg.select<SVGCircleElement>('circle[data-layer="atmosphere"]');
+    atmosphere
       .attr('cx', width / 2)
       .attr('cy', height / 2)
       .attr('r', radius)
@@ -73,106 +199,129 @@ const WorldMap: React.FC<WorldMapProps> = ({ regions, flows }) => {
       .style('filter', 'url(#glow)')
       .attr('opacity', 0.6);
 
-    // Graticule
-    const graticule = d3.geoGraticule();
+    svg.attr('width', width).attr('height', height);
+
     svg
-      .append('path')
+      .select<SVGPathElement>('path[data-layer="graticule"]')
       .datum(graticule())
-      .attr('d', path as any)
+      .attr('d', path as never)
       .attr('fill', 'none')
       .attr('stroke', '#2c3235')
       .attr('stroke-width', 0.5)
       .attr('opacity', 0.3);
 
-    // Landmass
-    svg
-      .append('g')
-      .selectAll('path')
-      .data(geoDataRef.current.features)
-      .enter()
-      .append('path')
-      .attr('d', path as any)
-      .attr('fill', '#111217')
-      .attr('stroke', '#3b82f6')
-      .attr('stroke-width', 0.3)
-      .attr('opacity', 0.9);
+    const selectedName = selectedRegion ? normalizeName(selectedRegion) : null;
+    const landGroup = svg.select<SVGGElement>('g[data-layer="land"]');
+    const countries = landGroup
+      .selectAll<SVGPathElement, WorldFeature>('path.country')
+      .data(geoDataRef.current.features, (feature) => getFeatureName(feature));
 
-    // Data arcs (flows)
-    const flowsGroup = svg.append('g');
-    flowsRef.current.forEach((flow) => {
-      const sourcePoint = projection(flow.source);
-      const targetPoint = projection(flow.target);
-      if (!sourcePoint || !targetPoint) return;
-
-      const isSourceVisible =
-        d3.geoDistance(flow.source, [-rotation[0], -rotation[1]]) < Math.PI / 2;
-      const isTargetVisible =
-        d3.geoDistance(flow.target, [-rotation[0], -rotation[1]]) < Math.PI / 2;
-
-      if (isSourceVisible && isTargetVisible) {
-        const geoLine = { type: 'LineString', coordinates: [flow.source, flow.target] };
-        flowsGroup
+    countries
+      .join((enter) =>
+        enter
           .append('path')
-          .datum(geoLine as any)
-          .attr('d', path as any)
-          .attr('fill', 'none')
-          .attr('stroke', '#f97316')
-          .attr('stroke-width', 1.5)
-          .attr('stroke-dasharray', '10,10')
-          .attr('opacity', 0.6)
-          .append('animate')
-          .attr('attributeName', 'stroke-dashoffset')
-          .attr('from', 100)
-          .attr('to', 0)
-          .attr('dur', '2s')
-          .attr('repeatCount', 'indefinite');
-      }
-    });
-
-    // Region hotspots
-    const hotspots = svg.append('g');
-    data.forEach((region) => {
-      const coords = projection(region.coords as [number, number]);
-      const isVisible =
-        d3.geoDistance(region.coords as [number, number], [-rotation[0], -rotation[1]]) <
-        Math.PI / 2;
-
-      if (coords && isVisible) {
-        const [x, y] = coords;
-        const bubbleSize = Math.max(3, (region.sales / 5000) * 4);
-
-        hotspots
-          .append('circle')
-          .attr('cx', x)
-          .attr('cy', y)
-          .attr('r', bubbleSize)
-          .attr('fill', '#32d74b')
-          .attr('stroke', 'white')
-          .attr('stroke-width', 0.5)
+          .attr('class', 'country')
           .style('cursor', 'pointer')
-          .on('mouseover', (event: MouseEvent) => {
-            setTooltip({ x: event.clientX, y: event.clientY, content: region });
+          .on('mouseenter', (event, feature) => {
+            const countryName = getFeatureName(feature);
+            setTooltip({
+              x: event.clientX,
+              y: event.clientY,
+              content: countryAggregates.get(countryName) ?? null,
+            });
           })
-          .on('mouseout', () => setTooltip((prev) => ({ ...prev, content: null })));
-      }
-    });
+          .on('mousemove', (event, feature) => {
+            const countryName = getFeatureName(feature);
+            setTooltip({
+              x: event.clientX,
+              y: event.clientY,
+              content: countryAggregates.get(countryName) ?? null,
+            });
+          })
+          .on('mouseleave', () => {
+            setTooltip((prev) => ({ ...prev, content: null }));
+          })
+          .on('click', (_, feature) => {
+            const countryName = getFeatureName(feature);
+            onSelectRegion?.(selectedName === normalizeName(countryName) ? null : countryName);
+          })
+      )
+      .attr('d', path as never)
+      .attr('fill', (feature) => {
+        const aggregate = countryAggregates.get(getFeatureName(feature));
+        return aggregate ? intensityScale(aggregate.intensity) : '#111217';
+      })
+      .attr('stroke', (feature) => {
+        const countryName = normalizeName(getFeatureName(feature));
+        return selectedName === countryName ? '#f8fafc' : '#3b82f6';
+      })
+      .attr('stroke-width', (feature) => {
+        const countryName = normalizeName(getFeatureName(feature));
+        return selectedName === countryName ? 1 : 0.35;
+      })
+      .attr('opacity', (feature) => {
+        const aggregate = countryAggregates.get(getFeatureName(feature));
+        return aggregate ? 0.96 : 0.9;
+      });
 
-    // Drag interaction
-    const drag = d3.drag<SVGSVGElement, unknown>().on('drag', (event) => {
-      const sensitivity = 0.25;
-      rotationRef.current = [
-        rotationRef.current[0] + event.dx * sensitivity,
-        rotationRef.current[1] - event.dy * sensitivity,
-        rotationRef.current[2],
-      ];
-      setRotationDisplay([...rotationRef.current] as [number, number, number]);
-      scheduleRender();
-    });
+    const visibleFlows = flows
+      .slice()
+      .sort((left, right) => right.value - left.value)
+      .filter((flow) => {
+        const sourceVisible = d3.geoDistance(flow.source, [-rotation[0], -rotation[1]]) < Math.PI / 2;
+        const targetVisible = d3.geoDistance(flow.target, [-rotation[0], -rotation[1]]) < Math.PI / 2;
+        return sourceVisible && targetVisible;
+      })
+      .slice(0, 24)
+      .map((flow) => ({ ...flow, type: 'LineString', coordinates: [flow.source, flow.target] }));
 
-    svg.call(drag as any);
-  }, []);
+    svg
+      .select<SVGGElement>('g[data-layer="flows"]')
+      .selectAll<SVGPathElement, DataFlow & { type: string; coordinates: [[number, number], [number, number]] }>('path.flow')
+      .data(visibleFlows, (flow) => flow.id)
+      .join((enter) => enter.append('path').attr('class', 'flow'))
+      .attr('d', path as never)
+      .attr('fill', 'none')
+      .attr('stroke', '#f97316')
+      .attr('stroke-width', (flow) => Math.max(1, Math.min(2.4, flow.value / 15000)))
+      .attr('stroke-dasharray', '5,7')
+      .attr('stroke-linecap', 'round')
+      .attr('opacity', 0.55);
 
-  // Schedule a render on the next animation frame (deduplicated)
+    const selectedAggregate =
+      selectedRegion
+        ? (Array.from(countryAggregates.values()) as CountryAggregate[]).find(
+            (aggregate) => normalizeName(aggregate.name) === normalizeName(selectedRegion)
+          ) ?? null
+        : null;
+
+    const focusFeature =
+      selectedAggregate &&
+      geoDataRef.current.features.find(
+        (feature) => normalizeName(getFeatureName(feature)) === normalizeName(selectedAggregate.name)
+      );
+
+    const focusData = focusFeature
+      ? (() => {
+          const [x, y] = path.centroid(focusFeature as never);
+          return Number.isFinite(x) && Number.isFinite(y) ? [{ x, y }] : [];
+        })()
+      : [];
+
+    svg
+      .select<SVGGElement>('g[data-layer="focus"]')
+      .selectAll<SVGCircleElement, { x: number; y: number }>('circle')
+      .data(focusData)
+      .join((enter) => enter.append('circle'))
+      .attr('cx', (point) => point.x)
+      .attr('cy', (point) => point.y)
+      .attr('r', 5)
+      .attr('fill', '#f8fafc')
+      .attr('stroke', '#32d74b')
+      .attr('stroke-width', 3)
+      .attr('opacity', 0.95);
+  }, [flows, initializeScene, onSelectRegion, selectedRegion]);
+
   const scheduleRender = useCallback(() => {
     if (renderScheduledRef.current) return;
     renderScheduledRef.current = true;
@@ -181,28 +330,36 @@ const WorldMap: React.FC<WorldMapProps> = ({ regions, flows }) => {
     });
   }, [renderGlobe]);
 
-  // Load GeoJSON once
   useEffect(() => {
-    d3.json(
-      'https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson'
-    ).then((data) => {
-      geoDataRef.current = data;
-      scheduleRender();
-    });
-  }, [scheduleRender]);
+    let cancelled = false;
 
-  // Sync props into refs and re-render whenever regions or flows change
+    loadWorldGeoJson()
+      .then((data) => {
+        if (cancelled) return;
+        geoDataRef.current = data;
+        syncCountryAggregates(regions);
+        scheduleRender();
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTooltip((prev) => ({ ...prev, content: null }));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [regions, scheduleRender, syncCountryAggregates]);
+
   useEffect(() => {
-    dataRef.current = regions;
+    syncCountryAggregates(regions);
     scheduleRender();
-  }, [regions, scheduleRender]);
+  }, [regions, scheduleRender, syncCountryAggregates]);
 
   useEffect(() => {
-    flowsRef.current = flows;
     scheduleRender();
-  }, [flows, scheduleRender]);
+  }, [flows, scheduleRender, selectedRegion]);
 
-  // Responsive resize
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -210,8 +367,8 @@ const WorldMap: React.FC<WorldMapProps> = ({ regions, flows }) => {
     const resizeObserver = new ResizeObserver(() => {
       scheduleRender();
     });
-    resizeObserver.observe(container);
 
+    resizeObserver.observe(container);
     return () => resizeObserver.disconnect();
   }, [scheduleRender]);
 
@@ -221,7 +378,6 @@ const WorldMap: React.FC<WorldMapProps> = ({ regions, flows }) => {
       className="w-full h-full relative overflow-hidden bg-black flex items-center justify-center"
       style={{ minHeight: '200px' }}
     >
-      {/* HUD Borders */}
       <div className="absolute inset-0 border border-blue-500/10 pointer-events-none">
         <div className="absolute top-0 left-0 w-8 h-8 sm:w-12 sm:h-12 border-t-2 border-l-2 border-blue-500/30"></div>
         <div className="absolute top-0 right-0 w-8 h-8 sm:w-12 sm:h-12 border-t-2 border-r-2 border-blue-500/30"></div>
@@ -231,11 +387,10 @@ const WorldMap: React.FC<WorldMapProps> = ({ regions, flows }) => {
 
       <svg ref={svgRef} className="w-full h-full cursor-move" />
 
-      {/* Rotation display */}
       <div className="absolute top-2 right-2 sm:top-4 sm:right-4 text-[8px] sm:text-[9px] font-mono text-blue-500/50 flex flex-col items-end">
         <span>ROT_X: {rotationDisplay[0].toFixed(2)}</span>
         <span>ROT_Y: {rotationDisplay[1].toFixed(2)}</span>
-        <span className="text-green-500">SYNC: LIVE</span>
+        <span className="text-green-500">MODE: CHOROPLETH</span>
       </div>
 
       {tooltip.content && (
@@ -250,22 +405,23 @@ const WorldMap: React.FC<WorldMapProps> = ({ regions, flows }) => {
             ${Math.round(tooltip.content.sales).toLocaleString()}
           </div>
           <div className="text-[9px] text-gray-500">
-            Node Intensity: {tooltip.content.intensity.toFixed(1)}%
+            Avg. Intensity: {tooltip.content.intensity.toFixed(1)}%
           </div>
+          <div className="text-[9px] text-gray-500">Nodes: {tooltip.content.nodeCount}</div>
         </div>
       )}
 
       <div className="absolute bottom-2 left-2 sm:bottom-4 sm:left-4 flex flex-col gap-1 p-1.5 sm:p-2 bg-black/40 border border-blue-500/10 rounded backdrop-blur-sm">
         <div className="flex items-center gap-1.5 sm:gap-2">
-          <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-orange-500 animate-pulse"></div>
+          <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-orange-500"></div>
           <span className="text-[7px] sm:text-[9px] font-bold text-gray-400 uppercase">
-            Live Data Flow
+            Prioritized Flow Paths
           </span>
         </div>
         <div className="flex items-center gap-1.5 sm:gap-2">
           <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-green-500"></div>
           <span className="text-[7px] sm:text-[9px] font-bold text-gray-400 uppercase">
-            Edge Node
+            Country Load Overlay
           </span>
         </div>
       </div>
